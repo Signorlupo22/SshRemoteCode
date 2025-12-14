@@ -1,219 +1,242 @@
-# SSH Remote Code
+# A New Execution Model for AI Agents
+## Why MCP is the wrong abstraction — and what comes next
 
-Execute code in a remote SSH sandbox with transparent function calling and TypeScript support.
+The Model Context Protocol (MCP) set out to connect AI models with external systems. What it accidentally did was turn the LLM itself into a state transport layer.
 
-## Features
+That is the fundamental mistake.
 
-- 🔐 SSH key authentication
-- 🎯 Transparent remote function calls (call remote functions as if they were local)
-- 📦 TypeScript support with type safety
-- 📁 File upload/download via SFTP
-- ⚡ Execute arbitrary code in remote sandbox
-- 🖥️ Shell command execution
-- 🔄 Connection management with error handling
+Every MCP interaction forces execution state to be serialized into tokens, passed through a neural network, and then reconstructed again. The model is no longer reasoning — it is acting as a lossy, expensive data bus.
 
-## Installation
+This is not a tooling problem.
+It is an execution model problem.
 
-```bash
-npm install ssh-remote-code
-```
+And it is why MCP collapses the moment workflows become real.
 
-## Quick Start
+## The core insight: LLMs are compilers, not runtimes
 
-### 1. Create a configuration file
+LLMs are extraordinarily good at writing code.
+They are not good at:
 
-```typescript
-// config.ts
-import { SshRemoteCodeConfig } from 'ssh-remote-code';
+- **Shuttling intermediate state between tool calls**
+- **Preserving execution context across turns**
+- **Acting as a memory layer for files, processes, sockets, or connections**
 
-export const homeassConf: SshRemoteCodeConfig = {
-  host: '192.168.1.100',
-  username: 'user',
-  privateKey: '/path/to/ssh/key', // or provide key content directly
-  sandboxPath: '/home/user/sandbox',
-  port: 22, // optional, defaults to 22
-};
-```
+MCP assumes the opposite.
 
-### 2. Use in your code
+It assumes the model should:
 
-```typescript
+- **Call a tool**
+- **Receive state as text**
+- **Re-process that state**
+- **Emit another tool call**
+- **Repeat**
+
+This forces every intermediate result through the neural network — even when the model is not reasoning about it.
+
+That is pure waste.
+
+Cloudflare reached the same conclusion from a different angle: agents do better when MCP tools are presented as a programming language API and the model writes code that calls it, instead of “tool calling” directly. See: [Code Mode: the better way to use MCP](https://blog.cloudflare.com/code-mode/).
+
+## The shift: move state out of the model entirely
+
+The new model is simple — and obvious in hindsight:
+
+- **The LLM writes code**
+- **The code executes elsewhere**
+- **State never goes back through the model unless explicitly needed**
+
+This is not “better MCP”.
+This is replacing MCP’s mental model altogether.
+
+The LLM stops being:
+
+- **A dispatcher**
+- **A message broker**
+- **A context store**
+
+And becomes what it actually is:
+
+- **A compiler targeting persistent execution environments**
+
+## What this library is (and what’s actually new)
+
+This repo provides a concrete, minimal execution substrate for that model:
+
+- **A persistent *machine* environment** (files, installed deps, long-running services) accessed over SSH
+- **A code-first interface**: TypeScript code and TypeScript interfaces, not “tool call tokens”
+- **Transparent remote function calls**: `import()` a module from a remote sandbox and call its exported functions as if they were local
+
+This is the key point:
+
+- **The model writes TypeScript**
+- **The TypeScript runs on a real machine**
+- **Only final answers need to return to the model**
+
+## TypeScript interfaces are the contract, not the prompt
+
+Natural language descriptions are an interpretation tax.
+Typed interfaces are not.
+
+When an LLM sees a TypeScript interface, it is not guessing. It is recognizing a pattern it has seen thousands of times: optional fields, return types, overload-like shapes, unions, and generics.
+
+- **MCP-style descriptions**: “Returns an object containing X, optionally Y...”
+- **TypeScript interfaces**: the exact shape, in the native language of code
+
+## Code examples
+
+### Single machine (basic)
+
+```ts
 import { SshRemoteCode } from 'ssh-remote-code';
-import { homeassConf } from './config';
 
-const homeassistant = new SshRemoteCode(homeassConf);
-await homeassistant.connect();
+const vps = new SshRemoteCode({
+  host: '192.168.1.65',
+  username: 'villafavero',
+  privateKey: 'C:\\Users\\faver\\.ssh\\id_ed25519',
+  sandboxPath: '/home/villafavero/testcode/dist',
+  preBuildCommand: true,
+  preBuildCustomCommand: 'npm install && npm run build',
+});
 
-// Import remote module and call functions
-const remoteModule = await homeassistant.import('./remote-functions');
-const result = await remoteModule.someFunction('arg1', 'arg2');
+await vps.connect();
 
-// Or execute code directly
-const result2 = await homeassistant.execute('someFunction()');
-
-// Disconnect when done
-await homeassistant.disconnect();
+// Remote module must exist under sandboxPath (compiled JS)
+const mod = await vps.import<{ add: (a: number, b: number) => Promise<number> }>('./index');
+const sum = await mod.add(2, 3);
 ```
 
-## Configuration
+### Multiple machines (one config file)
 
-The `SshRemoteCodeConfig` interface supports the following options:
+```ts
+// config.ts
+import type { SshRemoteCodeConfig } from 'ssh-remote-code';
 
-```typescript
-interface SshRemoteCodeConfig {
-  host: string;              // SSH host IP or hostname (required)
-  port?: number;            // SSH port (default: 22)
-  username: string;         // SSH username (required)
-  privateKey: string;       // SSH private key path or content (required if no password)
-  password?: string;        // SSH password (required if no privateKey)
-  sandboxPath: string;      // Path to sandbox directory on remote (required)
-  connectTimeout?: number;  // Connection timeout in ms (default: 10000)
-  readyTimeout?: number;    // Ready timeout in ms (default: 20000)
-}
-```
-
-### Private Key Options
-
-You can provide the private key in two ways:
-
-1. **File path**: `privateKey: '/path/to/key'`
-2. **Key content**: `privateKey: '-----BEGIN RSA PRIVATE KEY-----\n...'`
-
-## API Reference
-
-### `SshRemoteCode`
-
-Main class for SSH remote code execution.
-
-#### Methods
-
-##### `connect(): Promise<void>`
-
-Establish SSH connection to the remote machine.
-
-##### `disconnect(): Promise<void>`
-
-Close SSH connection.
-
-##### `isConnected(): boolean`
-
-Check if connection is active.
-
-##### `import<T>(modulePath: string): Promise<RemoteModule<T>>`
-
-Import a remote module and return a proxy object. The proxy allows calling functions as if they were local.
-
-**Parameters:**
-- `modulePath`: Path to the module relative to `sandboxPath`
-
-**Returns:** Proxy object that intercepts method calls
-
-**Example:**
-```typescript
-const remoteModule = await homeassistant.import('./my-module');
-const result = await remoteModule.myFunction('arg1', 'arg2');
-```
-
-##### `execute<T>(code: string): Promise<T>`
-
-Execute arbitrary JavaScript code in the remote sandbox.
-
-**Parameters:**
-- `code`: JavaScript code to execute
-
-**Returns:** Result of the execution
-
-**Example:**
-```typescript
-const result = await homeassistant.execute('1 + 1');
-```
-
-##### `runCommand(command: string): Promise<{ stdout: string; stderr: string; code: number | null }>`
-
-Execute a shell command on the remote machine.
-
-**Parameters:**
-- `command`: Shell command to execute
-
-**Returns:** Command output with stdout, stderr, and exit code
-
-**Example:**
-```typescript
-const { stdout, stderr, code } = await homeassistant.runCommand('ls -la');
-```
-
-##### `uploadFile(localPath: string, remotePath: string): Promise<void>`
-
-Upload a file to the remote machine via SFTP.
-
-**Parameters:**
-- `localPath`: Path to local file
-- `remotePath`: Path on remote machine
-
-**Example:**
-```typescript
-await homeassistant.uploadFile('./local-file.js', '/home/user/sandbox/file.js');
-```
-
-##### `downloadFile(remotePath: string, localPath: string): Promise<void>`
-
-Download a file from the remote machine via SFTP.
-
-**Parameters:**
-- `remotePath`: Path on remote machine
-- `localPath`: Path to save local file
-
-**Example:**
-```typescript
-await homeassistant.downloadFile('/home/user/sandbox/file.js', './local-file.js');
-```
-
-## Remote Module Structure
-
-Your remote sandbox should contain Node.js modules that export functions. For example:
-
-```javascript
-// /home/user/sandbox/remote-functions.js
-module.exports = {
-  someFunction: async (arg1, arg2) => {
-    // Your code here
-    return arg1 + arg2;
+export const machines: Record<string, SshRemoteCodeConfig> = {
+  build: {
+    host: '10.0.0.10',
+    username: 'ci',
+    privateKey: 'C:\\Users\\me\\.ssh\\id_ed25519',
+    sandboxPath: '/home/ci/sandbox',
+    preBuildCommand: true,
+    preBuildCustomCommand: 'npm ci && npm run build',
   },
-  
-  anotherFunction: (value) => {
-    return value * 2;
-  }
+  deploy: {
+    host: '10.0.0.11',
+    username: 'ops',
+    privateKey: 'C:\\Users\\me\\.ssh\\id_ed25519',
+    sandboxPath: '/home/ops/sandbox',
+  },
+  home: {
+    host: '192.168.1.65',
+    username: 'villafavero',
+    privateKey: 'C:\\Users\\faver\\.ssh\\id_ed25519',
+    sandboxPath: '/home/villafavero/testcode/dist',
+  },
 };
 ```
 
-Then you can import and use it:
+```ts
+import { SshRemoteCode } from 'ssh-remote-code';
+import { machines } from './config';
 
-```typescript
-const remoteModule = await homeassistant.import('./remote-functions');
-const result = await remoteModule.someFunction('hello', 'world');
-```
+const build = new SshRemoteCode(machines.build);
+const deploy = new SshRemoteCode(machines.deploy);
+const home = new SshRemoteCode(machines.home);
 
-## Type Safety
+await Promise.all([build.connect(), deploy.connect(), home.connect()]);
 
-The package is written in TypeScript and provides type safety for remote function calls. You can use generics to type your remote modules:
+// Parallel execution across machines
+const [artifact, status] = await Promise.all([
+  build.runCommand('cd /home/ci/sandbox && npm run build:artifact'),
+  deploy.runCommand('uname -a'),
+]);
 
-```typescript
-interface MyRemoteModule {
-  myFunction: (arg: string) => Promise<number>;
+// A workflow that spans machines
+if (artifact.code === 0) {
+  await deploy.runCommand('cd /home/ops/sandbox && ./deploy.sh');
+  await home.runCommand('echo "deploy done"'); // replace with your Home Assistant module calls
 }
-
-const remoteModule = await homeassistant.import<MyRemoteModule>('./my-module');
-// TypeScript will now know the types of myFunction
-const result: number = await remoteModule.myFunction('test');
 ```
 
-## Requirements
+### “The AI doesn’t know it’s calling other machines”
 
-- Node.js 14+ on both local and remote machines
-- SSH access to remote machine
-- Node.js installed in the remote sandbox directory
+Once you expose everything as TypeScript interfaces, orchestration becomes regular code. The model writes code like:
 
-## License
+```ts
+const metrics = await analytics.getVpsMetrics({ window: '24h' });
+if (metrics.errorRate > 0.05) {
+  await deploy.rollback();
+  await github.createIssue({ title: 'High error rate', body: JSON.stringify(metrics) });
+}
+```
 
-MIT
+Whether `analytics`, `deploy`, and `github` live on the same host, different SSH hosts, or different containers is an implementation detail the code can hide.
 
+## How it works (high level)
+
+- **`connect()`** opens an SSH connection; optionally runs a build command in the remote sandbox (`preBuildCommand`).
+- **`import('./module')`** returns a local JS `Proxy` object. Every method call becomes a remote execution.
+- **`execute(code)`** ships a JS snippet to the remote machine, runs it with Node, returns the parsed result.
+- **`runCommand(cmd)`** runs an arbitrary shell command over SSH.
+
+## How it works (under the hood, in this repo)
+
+This section describes what the current implementation actually does.
+
+### Remote module calls are a Proxy + “one-off node scripts”
+
+1. **`SshRemoteCode.import()` creates a `RemoteProxy`**
+   - The proxy intercepts property access (`proxy.someFunction`) and returns an async function.
+2. **That async function calls `RemoteExecutor.executeFunction(modulePath, functionName, args)`**
+3. **`RemoteExecutor` generates a temporary Node script**
+   - It `require()`s the module from `sandboxPath + modulePath`
+   - It finds the exported function by name
+   - It calls it with JSON-serialized args
+   - It prints a JSON envelope to stdout: `{ success, result }` (or `{ success:false, error }`)
+4. **The script is uploaded via SFTP to `/tmp/ssh-remote-code-<random>.js`**
+5. **The remote machine runs**: `node /tmp/ssh-remote-code-<random>.js`
+6. **The client captures stdout/stderr, parses the JSON result, and returns it**
+7. **The temp file is deleted**
+
+### Important nuance: what is “persistent” today
+
+With the current implementation, each `execute()` / remote function call runs as a fresh `node` process.
+
+- **Persistent today**
+  - **Remote filesystem** (artifacts, caches, logs)
+  - **Installed dependencies** and toolchains
+  - **External state** (databases, queues, HTTP services)
+  - **Long-running processes started separately** (e.g., via `runCommand('nohup ... &')` or systemd)
+
+- **Not persistent across calls (by default)**
+  - **In-memory JS state inside a Node process**
+  - **Module-level singletons that rely on the same Node runtime staying alive**
+
+If you need “memory persistence”, you typically do it the way real systems do it: a daemon/service (DB, Redis, worker), or a long-running process you start and monitor.
+
+## Why MCP breaks (in one paragraph)
+
+MCP makes the LLM act like the runtime. Every intermediate result is shoved through the model so the model can emit the next call. That creates a neural-network bottleneck and pollutes the context window with state that should have lived in a machine.
+
+This library’s stance is the opposite: let the model write code, let machines execute it, and let state live where state belongs.
+
+## The open-source multiplier (what the community can add)
+
+If the open-source community builds on this execution substrate, you can treat “other services” as just “other sandboxes”:
+
+- **Small cloud sandboxes** (e.g., AWS/GCP/Azure) dedicated to analytics, scheduled jobs, or metrics collection
+- **Deploy sandboxes** (e.g., Vercel/Netlify/Fly) that wrap provider APIs behind a stable TypeScript interface
+- **Docker image sandboxes** that come with pre-installed clients for GitHub, Stripe, Slack, etc.
+
+The endgame is a unified program surface:
+
+- The AI writes TypeScript against interfaces.
+- The execution hops across machines/containers transparently.
+- The AI does not need to “know” which host executes which call.
+
+## Summary
+
+MCP was a first attempt.
+This is the second.
+
+And this time, the execution model matches how both LLMs and computers actually work.
